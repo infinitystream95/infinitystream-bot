@@ -1,6 +1,7 @@
 import os
 from dotenv import load_dotenv
 from enum import Enum
+from telegram.ext import Application
 
 from telegram import (
     Update,
@@ -364,24 +365,33 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_main_menu(update, context)
 
 
-def main():
+def build_telegram_app() -> "Application":
+    """
+    Construit et configure l'application Telegram,
+    sans la démarrer. Utilisé par server.py.
+    """
     token = os.getenv("TELEGRAM_TOKEN")
     if not token:
         raise RuntimeError("La variable d'environnement TELEGRAM_TOKEN est manquante.")
 
+    # On garde l'init DB ici, c'est safe même si Discord l'appelle aussi
     init_db()
 
     app = ApplicationBuilder().token(token).build()
 
+    # Handlers exactement comme avant
     app.add_handler(CommandHandler("start", start))
-
-    # Boutons (inline)
     app.add_handler(CallbackQueryHandler(callback_handler))
-
-    # Tous les messages texte (hors commandes)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
-    # ⬇️ plus de await ici, run_polling est bloquant et gère tout seul la boucle
+    return app
+
+
+def main():
+    """
+    Mode 'standalone' si tu lances directement telegram_bot.py en local.
+    """
+    app = build_telegram_app()
     app.run_polling()
 
 
