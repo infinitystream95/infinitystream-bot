@@ -3,6 +3,7 @@ import discord
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 from datetime import datetime
+import aiohttp
 
 from db import (
     init_db,
@@ -14,6 +15,9 @@ from db import (
 )
 
 load_dotenv()
+
+TMDB_API_KEY = os.getenv("TMDB_API_KEY", "").strip()
+TMDB_DEFAULT_LANGUAGE = os.getenv("TMDB_LANGUAGE", "fr-FR")
 
 # ---------- CONFIG ----------
 
@@ -37,6 +41,22 @@ VALID_STATUSES = {
     "traitee": "Traité(e)",
     "ajout_dispo": "Ajout disponible",
     "ajout_non_dispo": "Ajout non disponible",
+}
+
+VALID_STATUSES = {
+    "file_attente": "Dans la file d'attente",
+    "en_cours": "En cours de traitement",
+    "traitee": "Traité(e)",
+    "ajout_dispo": "Ajout disponible",
+    "ajout_non_dispo": "Ajout non disponible",
+}
+
+STATUS_EMOJIS = {
+    "file_attente": "⏳",
+    "en_cours": "🛠",
+    "traitee": "✅",
+    "ajout_dispo": "📀",
+    "ajout_non_dispo": "❌",
 }
 
 intents = discord.Intents.default()
@@ -97,12 +117,42 @@ def format_requests_block(rows, limit: int, title: str, empty_message: str) -> d
 def build_list_overview_embed() -> discord.Embed:
     """Embed global qui s'affiche en permanence dans le salon de liste."""
     rows = list_all_requests()
-    embed = format_requests_block(
-        rows,
-        MAX_LIST_RESULTS,
-        "📊 Aperçu des demandes",
-        "Aucune demande enregistrée pour le moment.",
+
+    embed = discord.Embed(
+        title="📊 Aperçu des demandes",
+        colour=discord.Colour.blurple(),
     )
+
+    if not rows:
+        embed.description = "Aucune demande enregistrée pour le moment."
+    else:
+        # Regroupement par statut
+        grouped = {code: [] for code in VALID_STATUSES.keys()}
+        for r in rows:
+            status_code = r[6]
+            grouped.setdefault(status_code, []).append(r)
+
+        for status_code, status_label in VALID_STATUSES.items():
+            status_rows = grouped.get(status_code, [])
+
+            if not status_rows:
+                value = "_Aucune demande pour ce statut._"
+            else:
+                shown = status_rows[:MAX_OVERVIEW_PER_STATUS]
+                lines = [format_request_row(x) for x in shown]
+                if len(status_rows) > MAX_OVERVIEW_PER_STATUS:
+                    remaining = len(status_rows) - MAX_OVERVIEW_PER_STATUS
+                    lines.append(
+                        f"… et **{remaining}** autre(s) demande(s) pour ce statut."
+                    )
+                value = "\n".join(lines)
+
+            emoji = STATUS_EMOJIS.get(status_code, "•")
+            embed.add_field(
+                name=f"{emoji} {status_label}",
+                value=value,
+                inline=False,
+            )
 
     # Date / heure de la dernière mise à jour (heure du serveur)
     now_str = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
@@ -111,7 +161,6 @@ def build_list_overview_embed() -> discord.Embed:
     )
 
     return embed
-
 
 def find_duplicate_request(title: str, year: int, category: str):
     """Retourne la première demande qui a exactement le même titre + année + type, ou None."""
@@ -153,10 +202,70 @@ def count_user_requests_today(user_id: str) -> int:
             count += 1
     return count
 
+async def search_titles_from_tmdb(query: str) -> list[dict]:
+    """
+    Recherche des films / séries à partir d'un titre approximatif via TMDB.
+    Retourne une liste de dicts : {"title": str, "year": int, "category": "film"|"serie"}.
+    """
+    if not TMDB_API_KEY:
+        # Pas de clé => on ne peut pas utiliser l'auto-sélecteur
+        return []
+
+    url = "https://api.themoviedb.org/3/search/multi"
+    params = {
+        "api_key": TMDB_API_KEY,
+        "query": query,
+        "include_adult": "false",
+        "language": TMDB_DEFAULT_LANGUAGE,
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params, timeout=10) as resp:
+                if resp.status != 200:
+                    return []
+                data = await resp.json()
+    except Exception:
+        # En cas d'erreur réseau / timeout / etc.
+        return []
+
+    results: list[dict] = []
+    for item in data.get("results", []):
+        media_type = item.get("media_type")
+        if media_type not in ("movie", "tv"):
+            continue
+
+        if media_type == "movie":
+            raw_title = item.get("title") or item.get("original_title") or "Titre inconnu"
+            date_str = item.get("release_date") or ""
+            category = "film"
+        else:
+            raw_title = item.get("name") or item.get("original_name") or "Titre inconnu"
+            date_str = item.get("first_air_date") or ""
+            category = "serie"
+
+        year = 0
+        if date_str:
+            try:
+                year = int(date_str.split("-", 1)[0])
+            except ValueError:
+                year = 0
+
+        results.append(
+            {
+                "title": raw_title,
+                "year": year,
+                "category": category,
+            }
+        )
+
+    # Discord Select = max 25 options
+    return results[:25]
+
 MAX_SEARCH_RESULTS = 10
 MAX_LIST_RESULTS = 30
 MAX_ADMIN_RESULTS = 50
-
+MAX_OVERVIEW_PER_STATUS = 10
 
 # ---------- TASK D'AUTO-REFRESH DANS LE SALON DE LISTE ----------
 
@@ -201,20 +310,6 @@ class NewRequestModal(discord.ui.Modal, title="➕ Nouvelle demande"):
         max_length=200,
     )
 
-    annee = discord.ui.TextInput(
-        label="Année de sortie",
-        placeholder="2023",
-        required=True,
-        max_length=4,
-    )
-
-    type_oeuvre = discord.ui.TextInput(
-        label="Type",
-        placeholder="film ou serie",
-        required=True,
-        max_length=15,
-    )
-
     async def on_submit(self, interaction: discord.Interaction):
         # Vérification du salon (salon d'ajout)
         if not is_in_allowed_channel(interaction.channel, REQUEST_ADD_CHANNEL_ID):
@@ -230,74 +325,56 @@ class NewRequestModal(discord.ui.Modal, title="➕ Nouvelle demande"):
                 )
             return
 
-        # 🔒 Limite : 3 demandes par utilisateur et par jour
-        user_id = str(interaction.user.id)
-        today_count = count_user_requests_today(user_id)
-        if today_count >= 3:
+        if not TMDB_API_KEY:
             await interaction.response.send_message(
-                "❌ Tu as déjà atteint la limite de **3 demandes pour aujourd'hui**.\n"
-                "Réessaie demain 😉",
+                "⚠️ La recherche automatique n'est pas configurée "
+                "(variable d'environnement `TMDB_API_KEY` manquante).\n"
+                "Un administrateur doit renseigner une clé TMDB pour activer la sélection automatique.",
                 ephemeral=True,
             )
             return
 
         raw_title = str(self.titre.value).strip()
-        raw_year = str(self.annee.value).strip()
-        raw_cat = str(self.type_oeuvre.value).strip().lower()
 
-        try:
-            year = int(raw_year)
-        except ValueError:
+        # Recherche des œuvres correspondantes
+        results = await search_titles_from_tmdb(raw_title)
+
+        if not results:
             await interaction.response.send_message(
-                "❌ L'année doit être un nombre (ex : 2023).",
+                "❌ Impossible de trouver un film ou une série avec ce titre.\n"
+                "Vérifie l'orthographe ou réessaie avec un autre titre.",
                 ephemeral=True,
             )
             return
 
-        if raw_cat in ("film", "films"):
-            category = "film"
-        elif raw_cat in ("serie", "série", "series"):
-            category = "serie"
-        else:
-            await interaction.response.send_message(
-                "❌ Le type doit être `film` ou `serie`.",
-                ephemeral=True,
+        # Vue avec le sélecteur
+        view = discord.ui.View(timeout=60)
+        view.add_item(
+            RequestChoiceSelect(
+                requester_id=str(interaction.user.id),
+                results=results,
             )
-            return
+        )
 
-        # Doublon ?
-        existing = find_duplicate_request(raw_title, year, category)
-        if existing is not None:
-            embed = format_requests_block(
-                [existing],
-                1,
-                "⚠️ Demande déjà existante",
-                "Une demande similaire existe déjà.",
-            )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-            return
+        # Petit aperçu textuel des premiers résultats
+        lines_preview = []
+        for r in results[:5]:
+            year_txt = f" ({r['year']})" if r.get("year") else ""
+            type_txt = "Film" if r["category"] == "film" else "Série"
+            lines_preview.append(f"• **{r['title']}{year_txt}** — {type_txt}")
 
-        request_id = add_request(
-            user_id=user_id,
-            platform="discord",
-            title=raw_title,
-            year=year,
-            category=category,
+        description = (
+            "Sélectionne l'œuvre exacte dans la liste ci-dessous.\n\n"
+            + "\n".join(lines_preview)
         )
 
         embed = discord.Embed(
-            title="✅ Demande enregistrée",
-            description=(
-                f"ID : **#{request_id}**\n"
-                f"Titre : **{raw_title} ({year})**\n"
-                f"Type : `{category}`\n"
-                f"Statut : *{VALID_STATUSES['file_attente']}*"
-            ),
+            title="🎬 Sélectionne ton film / ta série",
+            description=description,
             colour=discord.Colour.green(),
         )
 
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 class SearchRequestModal(discord.ui.Modal, title="🔍 Rechercher une demande"):
 
@@ -561,6 +638,112 @@ class ResultRequestModal(discord.ui.Modal):
 
 
 # ---------- SELECTS & VIEWS ----------
+
+class RequestChoiceSelect(discord.ui.Select):
+    """Sélecteur de résultat (film/série) après la saisie du titre."""
+
+    def __init__(self, requester_id: str, results: list[dict]):
+        self.requester_id = requester_id
+        self.results = results
+
+        options: list[discord.SelectOption] = []
+        for idx, r in enumerate(results):
+            year_txt = f" ({r['year']})" if r.get("year") else ""
+            type_txt = "Film" if r["category"] == "film" else "Série"
+            label = f"{r['title']}{year_txt}"
+            description = type_txt
+
+            options.append(
+                discord.SelectOption(
+                    label=label[:100],
+                    value=str(idx),
+                    description=description[:100],
+                )
+            )
+
+        super().__init__(
+            placeholder="Choisis l'œuvre que tu souhaites demander…",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id="request_choice_select",
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        # Sécurité : seul l'utilisateur qui a ouvert le modal peut utiliser ce sélecteur
+        if str(interaction.user.id) != self.requester_id:
+            await interaction.response.send_message(
+                "❌ Tu ne peux pas utiliser ce sélecteur.",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            idx = int(self.values[0])
+        except (ValueError, IndexError):
+            await interaction.response.send_message(
+                "❌ Sélection invalide.",
+                ephemeral=True,
+            )
+            return
+
+        if idx < 0 or idx >= len(self.results):
+            await interaction.response.send_message(
+                "❌ Sélection invalide.",
+                ephemeral=True,
+            )
+            return
+
+        data = self.results[idx]
+        title = data["title"]
+        year = int(data.get("year") or 0)
+        category = data["category"]
+
+        # 🔒 Limite : 3 demandes par utilisateur et par jour
+        today_count = count_user_requests_today(self.requester_id)
+        if today_count >= 3:
+            await interaction.response.send_message(
+                "❌ Tu as déjà atteint la limite de **3 demandes pour aujourd'hui**.\n"
+                "Réessaie demain 😉",
+                ephemeral=True,
+            )
+            return
+
+        # Vérification de doublon (titre + année + type)
+        existing = find_duplicate_request(title, year, category)
+        if existing is not None:
+            embed = format_requests_block(
+                [existing],
+                1,
+                "⚠️ Demande déjà existante",
+                "Une demande similaire existe déjà.",
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
+        # Création de la demande
+        request_id = add_request(
+            user_id=self.requester_id,
+            platform="discord",
+            title=title,
+            year=year,
+            category=category,
+        )
+
+        status_label = VALID_STATUSES["file_attente"]
+        year_txt = f" ({year})" if year else ""
+        embed = discord.Embed(
+            title="✅ Demande enregistrée",
+            description=(
+                f"ID : **#{request_id}**\n"
+                f"Titre : **{title}{year_txt}**\n"
+                f"Type : `{category}`\n"
+                f"Statut : *{status_label}*"
+            ),
+            colour=discord.Colour.green(),
+        )
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
 class StatusSelect(discord.ui.Select):
     def __init__(self, request_id: int):
