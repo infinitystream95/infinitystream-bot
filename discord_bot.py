@@ -11,6 +11,7 @@ from db import (
     list_open_requests,
     list_all_requests,
     update_status,
+    update_result,
     delete_request,
 )
 
@@ -38,27 +39,22 @@ ADMIN_IDS = {
 VALID_STATUSES = {
     "file_attente": "Dans la file d'attente",
     "en_cours": "En cours de traitement",
-    "traitee": "Traité(e)",
-    "ajout_dispo": "Ajout disponible",
     "ajout_non_dispo": "Ajout non disponible",
-}
-
-VALID_STATUSES = {
-    "file_attente": "Dans la file d'attente",
-    "en_cours": "En cours de traitement",
-    "traitee": "Traité(e)",
-    "ajout_dispo": "Ajout disponible",
-    "ajout_non_dispo": "Ajout non disponible",
+    "pas_encore_sorti": "Pas encore sorti",
 }
 
 STATUS_EMOJIS = {
     "file_attente": "⏳",
     "en_cours": "🛠",
-    "traitee": "✅",
-    "ajout_dispo": "📀",
-    "ajout_non_dispo": "❌",
+    "ajout_non_dispo": "🚫",
+    "pas_encore_sorti": "❌",
 }
 
+RESULT_LABELS = {
+    "": "—",
+    "dispo": "✅ Résultat dispo",
+    "non_dispo": "🚫 Résultat non dispo",
+}
 intents = discord.Intents.default()
 intents.message_content = True
 
@@ -83,16 +79,45 @@ def is_in_allowed_channel(channel: discord.abc.GuildChannel, allowed_id: int) ->
     return channel.id == allowed_id
 
 
-def format_request_row(row) -> str:
-    req_id, user_id, platform, title, year, category, status, created_at = row
+def format_request_row(row, include_requester: bool = False, include_result: bool = False) -> str:
+    # row = (req_id, user_id, platform, title, year, category, status, created_at, result?)
+    req_id = row[0]
+    user_id = row[1]
+    title = row[3]
+    year = int(row[4] or 0) if len(row) > 4 else 0
+    category = row[5] if len(row) > 5 else ""
+    status = row[6] if len(row) > 6 else ""
+    result = row[8] if len(row) > 8 else ""
+
     status_label = VALID_STATUSES.get(status, status)
+    emoji = STATUS_EMOJIS.get(status, "•")
+
+    year_txt = f" ({year})" if year else ""
+    requester_txt = f" • par <@{user_id}>" if include_requester else ""
+
+    result_txt = ""
+    if include_result:
+        if result == "dispo":
+            result_txt = " • ✅ Résultat dispo"
+        elif result == "non_dispo":
+            result_txt = " • 🚫 Résultat non dispo"
+        else:
+            result_txt = " • Résultat: —"
+
     return (
-        f"**#{req_id}** • **{title} ({year})** • `{category}` • "
-        f"Statut: *{status_label}*"
+        f"**#{req_id}** • **{title}{year_txt}** • `{category}`"
+        f"{requester_txt} • Statut: {emoji} *{status_label}*{result_txt}"
     )
 
 
-def format_requests_block(rows, limit: int, title: str, empty_message: str) -> discord.Embed:
+def format_requests_block(
+    rows,
+    limit: int,
+    title: str,
+    empty_message: str,
+    include_requester: bool = False,
+    include_result: bool = False,
+) -> discord.Embed:
     """Crée un embed 'propre' pour une liste de demandes."""
     embed = discord.Embed(
         title=title,
@@ -105,7 +130,7 @@ def format_requests_block(rows, limit: int, title: str, empty_message: str) -> d
 
     total = len(rows)
     shown = rows[:limit]
-    lines = [format_request_row(r) for r in shown]
+    lines = [format_request_row(r, include_requester=include_requester, include_result=include_result) for r in shown]
     if total > limit:
         remaining = total - limit
         lines.append(f"… et **{remaining}** autre(s) demande(s).")
@@ -167,7 +192,9 @@ def find_duplicate_request(title: str, year: int, category: str):
     rows = list_all_requests()
     normalized_title = title.strip().lower()
     for row in rows:
-        req_id, user_id, platform, row_title, row_year, row_category, status, created_at = row
+        row_title = row[3]
+        row_year = row[4]
+        row_category = row[5]
         if (
             row_title.strip().lower() == normalized_title
             and int(row_year) == int(year)
@@ -527,7 +554,7 @@ class DeleteRequestModal(discord.ui.Modal, title="🗑 Supprimer une demande"):
 class ResultRequestModal(discord.ui.Modal):
 
     def __init__(self, is_available: bool):
-        title = "📢 Résultat : ajout disponible" if is_available else "📢 Résultat : ajout non disponible"
+        title = "📢 Résultat : dispo" if is_available else "📢 Résultat : non dispo"
         super().__init__(title=title)
         self.is_available = is_available
 
@@ -588,8 +615,8 @@ class ResultRequestModal(discord.ui.Modal):
             )
             return
 
-        status_code = "ajout_dispo" if self.is_available else "ajout_non_dispo"
-        ok = update_status(req_id, status_code)
+        result_code = "dispo" if self.is_available else "non_dispo"
+        ok = update_result(req_id, result_code)
         if not ok:
             await interaction.response.send_message(
                 f"❌ Impossible de mettre à jour la demande #{req_id}.",
@@ -614,12 +641,17 @@ class ResultRequestModal(discord.ui.Modal):
             )
             return
 
-        req_id_row, user_id, platform, title, year, category, status, created_at = row
-        user_mention = f"<@{user_id}>"
-        etat_label = "✅ **Ajout disponible**" if self.is_available else "❌ **Ajout non disponible**"
+        req_id_row = row[0]
+        user_id = row[1]
+        title = row[3]
+        year = int(row[4] or 0) if len(row) > 4 else 0
+        category = row[5] if len(row) > 5 else ""
 
+        user_mention = f"<@{user_id}>"
+        etat_label = "✅ **Résultat disponible**" if self.is_available else "🚫 **Résultat non dispo**"
+        year_txt = f" ({year})" if year else ""
         description = (
-            f"{etat_label} pour ta demande **#{req_id_row}** : **{title} ({year})** • `{category}`\n"
+            f"{etat_label} pour ta demande **#{req_id_row}** : **{title}{year_txt}** • `{category}`\n"
         )
         if commentaire:
             description += f"📝 {commentaire}"
@@ -761,18 +793,13 @@ class StatusSelect(discord.ui.Select):
                 emoji="🛠",
             ),
             discord.SelectOption(
-                label="Traité(e)",
-                value="traitee",
-                emoji="✅",
-            ),
-            discord.SelectOption(
-                label="Ajout disponible",
-                value="ajout_dispo",
-                emoji="📀",
-            ),
-            discord.SelectOption(
                 label="Ajout non disponible",
                 value="ajout_non_dispo",
+                emoji="🚫",
+            ),
+            discord.SelectOption(
+                label="Pas encore sorti",
+                value="pas_encore_sorti",
                 emoji="❌",
             ),
         ]
@@ -817,7 +844,7 @@ class StatusSelectView(discord.ui.View):
 
 class AdminPanelView(discord.ui.View):
     def __init__(self):
-        super().__init__(timeout=120)
+        super().__init__(timeout=None)
 
     @discord.ui.button(
         label="📚 Toutes les demandes",
@@ -855,6 +882,8 @@ class AdminPanelView(discord.ui.View):
             MAX_ADMIN_RESULTS,
             "📚 Toutes les demandes",
             "Aucune demande enregistrée.",
+            include_requester=True,
+            include_result=True,
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -1078,6 +1107,15 @@ class SearchPanelView(discord.ui.View):
 @bot.event
 async def on_ready():
     init_db()
+    # Vues persistantes (pour éviter de refaire !panel_* après un restart)
+    try:
+        bot.add_view(AddPanelView())
+        bot.add_view(ListPanelView())
+        bot.add_view(SearchPanelView())
+        bot.add_view(AdminPanelView())
+    except Exception:
+        # discord.py peut lever si on enregistre deux fois les mêmes custom_id
+        pass
     print(f"Connecté en tant que {bot.user} (ID: {bot.user.id})")
     # On démarre la tâche d'auto-refresh si elle n'est pas déjà en cours
     if not update_list_overview.is_running():
