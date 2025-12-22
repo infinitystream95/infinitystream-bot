@@ -20,6 +20,13 @@ load_dotenv()
 TMDB_API_KEY = os.getenv("TMDB_API_KEY", "").strip()
 TMDB_DEFAULT_LANGUAGE = os.getenv("TMDB_LANGUAGE", "fr-FR")
 
+# IDs (Discord) autorisés à faire des demandes illimitées (bypass la limite quotidienne)
+# Dans le .env : UNLIMITED_USER_IDS=1234567890,0987654321
+_raw_unlimited_ids = os.getenv("UNLIMITED_USER_IDS", "")
+UNLIMITED_USER_IDS: set[str] = {
+    x.strip() for x in _raw_unlimited_ids.split(",") if x.strip().isdigit()
+}
+
 # ---------- CONFIG ----------
 
 REQUEST_NOTIFICATION_CHANNEL_ID = int(os.getenv("REQUEST_NOTIFICATION_CHANNEL_ID", "0"))
@@ -732,14 +739,16 @@ class RequestChoiceSelect(discord.ui.Select):
         category = data["category"]
 
         # 🔒 Limite : 3 demandes par utilisateur et par jour
-        today_count = count_user_requests_today(self.requester_id)
-        if today_count >= 3:
-            await interaction.response.send_message(
-                "❌ Tu as déjà atteint la limite de **3 demandes pour aujourd'hui**.\n"
-                "Réessaie demain 😉",
-                ephemeral=True,
-            )
-            return
+        # ✅ Exception : si l'ID de l'utilisateur est dans UNLIMITED_USER_IDS (défini dans le .env), aucune limite.
+        if self.requester_id not in UNLIMITED_USER_IDS:
+            today_count = count_user_requests_today(self.requester_id)
+            if today_count >= 3:
+                await interaction.response.send_message(
+                    "❌ Tu as déjà atteint la limite de **3 demandes pour aujourd'hui**.\n"
+                    "Réessaie demain 😉",
+                    ephemeral=True,
+                )
+                return
 
         # Vérification de doublon (titre + année + type)
         existing = find_duplicate_request(title, year, category)
