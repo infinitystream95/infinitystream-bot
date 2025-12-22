@@ -86,7 +86,12 @@ def is_in_allowed_channel(channel: discord.abc.GuildChannel, allowed_id: int) ->
     return channel.id == allowed_id
 
 
-def format_request_row(row, include_requester: bool = False, include_result: bool = False) -> str:
+def format_request_row(
+    row,
+    include_requester: bool = False,
+    include_result: bool = False,
+    show_status: bool = True,
+) -> str:
     # row = (req_id, user_id, platform, title, year, category, status, created_at, result?)
     req_id = row[0]
     user_id = row[1]
@@ -111,10 +116,12 @@ def format_request_row(row, include_requester: bool = False, include_result: boo
         else:
             result_txt = " • Résultat: —"
 
-    return (
-        f"**#{req_id}** • **{title}{year_txt}** • `{category}`"
-        f"{requester_txt} • Statut: {emoji} *{status_label}*{result_txt}"
-    )
+    base = f"**#{req_id}** • **{title}{year_txt}** • `{category}`{requester_txt}"
+
+    if show_status:
+        base += f" • Statut: {emoji} *{status_label}*"
+
+    return base + result_txt
 
 
 def format_requests_block(
@@ -171,7 +178,7 @@ def build_list_overview_embed() -> discord.Embed:
                 value = "_Aucune demande pour ce statut._"
             else:
                 shown = status_rows[:MAX_OVERVIEW_PER_STATUS]
-                lines = [format_request_row(x) for x in shown]
+                lines = [format_request_row(x, show_status=False) for x in shown]
                 if len(status_rows) > MAX_OVERVIEW_PER_STATUS:
                     remaining = len(status_rows) - MAX_OVERVIEW_PER_STATUS
                     lines.append(
