@@ -3,6 +3,8 @@ import asyncio
 from aiohttp import web
 from dotenv import load_dotenv
 
+import discord  # <-- IMPORTANT
+
 from discord_bot import bot
 from telegram_bot import build_telegram_app
 
@@ -42,7 +44,6 @@ async def main():
     telegram_app = build_telegram_app()
     await telegram_app.initialize()
     await telegram_app.start()
-    # lance le polling en tâche de fond
     await telegram_app.updater.start_polling()
     print("[TELEGRAM] Bot Telegram démarré (polling)")
 
@@ -51,13 +52,32 @@ async def main():
     if not discord_token:
         raise RuntimeError("La variable d'environnement DISCORD_TOKEN est manquante.")
 
-    print("[DISCORD] Démarrage du bot Discord…")
+    delay = 10
+
     try:
-        # Cette ligne bloque tant que le bot Discord est en ligne,
-        # mais laisse tourner Telegram + HTTP dans la même boucle asyncio.
-        await bot.start(discord_token)
+        print("[DISCORD] Démarrage du bot Discord…")
+        while True:
+            try:
+                await bot.start(discord_token)
+                # Si bot.start() retourne, le bot s'est arrêté (ou fermé)
+                break
+
+            except discord.HTTPException as e:
+                # 429 / rate limit (Cloudflare 1015 arrive souvent comme ça)
+                if getattr(e, "status", None) == 429:
+                    print(f"[DISCORD] Rate limited (429). Nouvelle tentative dans {delay}s…")
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, 900)
+                    continue
+                raise
+
+            except Exception as e:
+                print(f"[DISCORD] Erreur: {e}. Nouvelle tentative dans {delay}s…")
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 900)
+
     finally:
-        # Arrêt propre de Telegram si le process se termine
+        # Arrêt propre de Telegram + serveur web si le process se termine
         print("[TELEGRAM] Arrêt du bot Telegram…")
         try:
             await telegram_app.updater.stop()
@@ -65,6 +85,11 @@ async def main():
             await telegram_app.shutdown()
         except Exception as e:
             print(f"[TELEGRAM] Erreur à l'arrêt : {e}")
+
+        try:
+            await runner.cleanup()
+        except Exception as e:
+            print(f"[WEB] Erreur à l'arrêt : {e}")
 
 
 if __name__ == "__main__":
